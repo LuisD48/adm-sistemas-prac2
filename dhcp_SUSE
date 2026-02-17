@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-#  GESTOR DHCP - TAREA 2 (OpenSUSE)
-#  Adaptación exacta del script PowerShell
+#  GESTOR DHCP
 # ==========================================
 
 # --- 1. VALIDACIONES INICIALES ---
