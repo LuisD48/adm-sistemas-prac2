@@ -1,0 +1,276 @@
+#!/bin/bash
+
+# ==========================================
+#  GESTOR DHCP - TAREA 2 (OpenSUSE)
+#  Adaptación exacta del script PowerShell
+# ==========================================
+
+# --- 1. VALIDACIONES INICIALES ---
+
+# Validar que sea Root
+if [ "$EUID" -ne 0 ]; then
+  echo -e "\e[31m[ERROR] Este script requiere privilegios de administrador (root).\e[0m"
+  echo "Ejecute con: sudo $0"
+  exit 1
+fi
+
+# Función para validar formato IP (Regex)
+validar_ip() {
+    if [[ $1 =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        # Validar que no sea 0.0.0.0 o 255...
+        if [ "$1" == "0.0.0.0" ] || [ "$1" == "255.255.255.255" ]; then return 1; fi
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Función para convertir IP a entero (para comparaciones)
+ip_a_int() {
+    IFS=. read -r a b c d <<< "$1"
+    echo $((a * 256 ** 3 + b * 256 ** 2 + c * 256 + d))
+}
+
+# --- 2. OPCIONES DEL MENÚ ---
+
+opcion1_verificar() {
+    clear
+    echo -e "\e[36m========================================\e[0m"
+    echo -e "\e[36m   [1] VERIFICAR INSTALACIÓN DHCP\e[0m"
+    echo -e "\e[36m========================================\e[0m"
+    
+    if rpm -q dhcp-server &> /dev/null; then
+        echo -e "\n\e[32m DHCP ESTÁ INSTALADO\e[0m"
+        
+        # Verificar servicio
+        if systemctl is-active --quiet dhcpd; then
+             echo -e " Estado del servicio: \e[32mRunning\e[0m"
+        else
+             echo -e " Estado del servicio: \e[33mStopped\e[0m"
+        fi
+    else
+        echo -e "\n\e[31m DHCP NO ESTÁ INSTALADO\e[0m"
+        echo -e "\e[33m Use la Opción [2] para instalarlo.\e[0m"
+    fi
+    read -p "Presione Enter para volver..."
+}
+
+opcion2_instalacion() {
+    clear
+    echo -e "\e[36m========================================\e[0m"
+    echo -e "\e[36m   [2] INSTALACIÓN DHCP\e[0m"
+    echo -e "\e[36m========================================\e[0m"
+
+    # A. INSTALACIÓN DE PAQUETES
+    if rpm -q dhcp-server &> /dev/null; then
+        echo -e "\e[33m[INFO] DHCP ya está instalado.\e[0m"
+        read -p "¿Desea REINSTALAR y borrar configuración? (s/n): " resp
+        if [[ "$resp" =~ ^[sS]$ ]]; then
+            echo "Desinstalando..."
+            zypper remove -y dhcp-server &> /dev/null
+            rm -rf /etc/dhcpd.conf
+            echo "Reinstalando..."
+            zypper install -y dhcp-server &> /dev/null
+        fi
+    else
+        echo "Instalando DHCP (puede tardar)..."
+        zypper install -y dhcp-server
+        if [ $? -ne 0 ]; then
+            echo -e "\e[31m[ERROR] Falló la instalación. Revisa tu internet.\e[0m"
+            read -p "Enter para volver..."
+            return
+        fi
+        echo -e "\e[32m[OK] Instalado.\e[0m"
+    fi
+
+    # B. CONFIGURACIÓN (WIZARD)
+    echo -e "\n\e[36m--- CONFIGURACIÓN DEL ÁMBITO ---\e[0m"
+
+    # 1. Selección de Interfaz (OBLIGATORIO EN LINUX)
+    # Listamos tarjetas para que el usuario elija
+    echo "Interfaces disponibles:"
+    ip -o link show | awk -F': ' '{print $2}' | grep -vE "^(lo|docker|virbr)" > /tmp/ifaces.txt
+    IFS=$'\n' read -d '' -r -a interfaces < /tmp/ifaces.txt
+    
+    cnt=1
+    for iface in "${interfaces[@]}"; do
+        IP_ACTUAL=$(ip -4 addr show $iface | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        echo "[$cnt] $iface (IP: ${IP_ACTUAL:-Sin IP})"
+        ((cnt++))
+    done
+
+    while true; do
+        read -p "Seleccione el NÚMERO de la interfaz (ej. 1): " sel
+        if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#interfaces[@]}" ]; then
+            IFACE=${interfaces[$((sel-1))]}
+            break
+        else
+            echo -e "\e[31mOpción inválida.\e[0m"
+        fi
+    done
+
+    # 2. Datos del Ámbito
+    read -p "Nombre del Ámbito (ej. Red-Sistemas): " NOMBRE_SCOPE
+    
+    # IP Inicial (.50)
+    while true; do
+        read -p "IP Inicial (debe terminar en .50): " IP_START
+        if ! validar_ip $IP_START; then echo "Formato inválido"; continue; fi
+        
+        # Validar terminación .50
+        OCTETO_FINAL=$(echo $IP_START | awk -F. '{print $4}')
+        if [ "$OCTETO_FINAL" -ne 50 ]; then
+            echo -e "\e[31m[ERROR] La IP debe terminar en .50\e[0m"
+        else
+            break
+        fi
+    done
+
+    # IP Final (.150)
+    while true; do
+        read -p "IP Final (debe terminar en .150): " IP_END
+        if ! validar_ip $IP_END; then echo "Formato inválido"; continue; fi
+        
+        # Validar terminación .150
+        OCTETO_FINAL=$(echo $IP_END | awk -F. '{print $4}')
+        if [ "$OCTETO_FINAL" -ne 150 ]; then
+            echo -e "\e[31m[ERROR] La IP debe terminar en .150\e[0m"
+            continue
+        fi
+
+        # Validar Mayor que inicial
+        INT_START=$(ip_a_int $IP_START)
+        INT_END=$(ip_a_int $IP_END)
+        if [ $INT_START -ge $INT_END ]; then
+            echo -e "\e[31m[ERROR] La IP Final debe ser mayor a la Inicial.\e[0m"
+        else
+            break
+        fi
+    done
+
+    # Gateway y DNS
+    while true; do
+        read -p "Gateway: " GATEWAY
+        validar_ip $GATEWAY && break || echo "IP inválida"
+    done
+
+    while true; do
+        read -p "DNS Primario: " DNS1
+        validar_ip $DNS1 && break || echo "IP inválida"
+    done
+
+    # Calcular Datos de Red (Máscara y Subnet)
+    # Asumimos clase C estándar (/24) basado en el input del usuario
+    SUBNET=$(echo $IP_START | cut -d'.' -f1-3).0
+    NETMASK="255.255.255.0" # Simplificado como en el script de Windows
+
+    echo -e "\n\e[36m--- RESUMEN ---\e[0m"
+    echo "Interfaz: $IFACE"
+    echo "Rango:    $IP_START - $IP_END"
+    echo "Mascara:  $NETMASK"
+    echo "Gateway:  $GATEWAY"
+    
+    read -p "¿Confirmar configuración? (s/n): " confirm
+    if [[ ! "$confirm" =~ ^[sS]$ ]]; then return; fi
+
+    # C. APLICAR CONFIGURACIÓN
+    echo "Generando /etc/dhcpd.conf..."
+    
+    cat > /etc/dhcpd.conf <<EOF
+option domain-name "$NOMBRE_SCOPE";
+option domain-name-servers $DNS1;
+default-lease-time 600;
+max-lease-time 7200;
+ddns-update-style none;
+authoritative;
+
+subnet $SUBNET netmask $NETMASK {
+  range $IP_START $IP_END;
+  option routers $GATEWAY;
+}
+EOF
+
+    # D. VINCULAR INTERFAZ (Truco OpenSUSE)
+    sed -i 's/^DHCPD_INTERFACE=.*/DHCPD_INTERFACE="'$IFACE'"/' /etc/sysconfig/dhcpd
+
+    # E. FIREWALL Y SERVICIO
+    echo "Abriendo Firewall..."
+    firewall-cmd --add-service=dhcp --permanent &> /dev/null
+    firewall-cmd --reload &> /dev/null
+
+    echo "Reiniciando servicio..."
+    systemctl enable dhcpd &> /dev/null
+    systemctl restart dhcpd
+
+    if systemctl is-active --quiet dhcpd; then
+        echo -e "\n\e[32m   DHCP CONFIGURADO CORRECTAMENTE   \e[0m"
+        echo "Cliente Linux: sudo dhclient -v $IFACE"
+        echo "Cliente Windows: ipconfig /renew"
+    else
+        echo -e "\n\e[31m[ERROR] El servicio no arrancó.\e[0m"
+        systemctl status dhcpd --no-pager
+    fi
+    read -p "Presione Enter para volver..."
+}
+
+opcion3_monitorear() {
+    clear
+    echo -e "\e[36m========================================\e[0m"
+    echo -e "\e[36m   [3] MONITOREAR CONCESIONES\e[0m"
+    echo -e "\e[36m========================================\e[0m"
+    
+    LEASE_FILE="/var/lib/dhcp/db/dhcpd.leases"
+    
+    if [ -f "$LEASE_FILE" ]; then
+        echo -e "\nIP ADDRESS\tMAC ADDRESS\tHOSTNAME"
+        echo "------------------------------------------------"
+        # Pequeño parser para mostrar datos limpios
+        grep -E "lease|hardware|client-hostname" $LEASE_FILE | awk '
+        /lease/ {ip=$2} 
+        /hardware/ {mac=$3} 
+        /client-hostname/ {name=$2; print ip "\t" mac "\t" name}' | sed 's/;//g' | sed 's/"//g'
+    else
+        echo -e "\e[33mNo hay archivo de concesiones aún.\e[0m"
+    fi
+    read -p "Presione Enter para volver..."
+}
+
+opcion4_restaurar() {
+    clear
+    echo -e "\e[31m========================================\e[0m"
+    echo -e "\e[31m   [4] RESTAURAR (DESINSTALAR)\e[0m"
+    echo -e "\e[31m========================================\e[0m"
+    
+    read -p "¿ESTÁ SEGURO? Se borrará todo (s/n): " confirm
+    if [[ "$confirm" =~ ^[sS]$ ]]; then
+        systemctl stop dhcpd
+        zypper remove -y dhcp-server
+        rm -rf /etc/dhcpd.conf
+        rm -rf /var/lib/dhcp/db/dhcpd.leases
+        echo -e "\e[32m[LISTO] Sistema limpio.\e[0m"
+    fi
+    read -p "Presione Enter para volver..."
+}
+
+# --- 3. BUCLE PRINCIPAL ---
+
+while true; do
+    clear
+    echo -e "\e[33m===   MENU (OpenSUSE)   ===\e[0m"
+    echo "[1] Verificar instalacion DHCP"
+    echo "[2] Instalacion (Silenciosa)"
+    echo "[3] Monitorear"
+    echo "[4] Restaurar"
+    echo "[5] Salir"
+    echo ""
+    read -p "Seleccione una opción: " op
+    
+    case $op in
+        1) opcion1_verificar ;;
+        2) opcion2_instalacion ;;
+        3) opcion3_monitorear ;;
+        4) opcion4_restaurar ;;
+        5) echo "Saliendo..."; exit 0 ;;
+        *) echo "Opción inválida." ; sleep 1 ;;
+    esac
+done
