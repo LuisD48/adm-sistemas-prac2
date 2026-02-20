@@ -1,7 +1,6 @@
 #!/bin/bash
 # ============================================================
 # Gestor DHCP - OpenSUSE Linux
-# Equivalente Bash del script PowerShell dhcp_win_v6.ps1
 # Servicio: isc-dhcp-server (dhcp-server en OpenSUSE)
 # Archivo de config: /etc/dhcpd.conf
 # ============================================================
@@ -329,8 +328,9 @@ NETMASK='255.255.255.0'
 GATEWAY='${GATEWAY}'
 STARTMODE='auto'
 EOF
-        # DNS persistente
-        echo "nameserver $DNS" > /etc/resolv.conf
+        # DNS persistente (crear resolv.conf si no existe)
+        mkdir -p /etc 2>/dev/null
+        echo "nameserver $DNS" > /etc/resolv.conf 2>/dev/null || true
         log_ok "Configuración de red persistida en $cfg_iface"
     else
         log_error "Error configurando IP estática."
@@ -347,13 +347,48 @@ EOF
     echo -e "\n${Y}[PASO 4] Verificando paquete DHCP...${N}"
     if ! rpm -q dhcp-server &>/dev/null; then
         log_info "Instalando dhcp-server (modo no interactivo)..."
-        zypper refresh 2>/dev/null || log_warn "No se pudo refrescar repositorios, intentando igual..."
-        if zypper install -y dhcp-server; then
-            log_ok "Paquete dhcp-server instalado."
+        # Intentar primero con repositorios en linea
+        local instalado_pkg=false
+        zypper refresh 2>/dev/null
+        if zypper install -y dhcp-server 2>/dev/null; then
+            log_ok "Paquete dhcp-server instalado desde repositorio online."
+            instalado_pkg=true
         else
-            log_error "No se pudo instalar dhcp-server."
-            log_error "Posibles causas: sin internet, repositorios desactualizados o nombre incorrecto."
-            log_info "Intente manualmente: zypper install -y dhcp-server"
+            log_warn "Repositorios online no disponibles. Buscando DVD/ISO montado..."
+
+            # Buscar ISO/DVD montado automaticamente
+            local iso_mount=""
+            for ruta in /media/*/DVD /media/*/dvd /run/media/*/*/ /mnt/dvd /mnt/iso /dev/sr0; do
+                if findmnt "$ruta" &>/dev/null 2>&1 || mountpoint -q "$ruta" 2>/dev/null; then
+                    iso_mount="$ruta"
+                    break
+                fi
+            done
+
+            # Si no encontro automatico, preguntar al usuario
+            if [[ -z "$iso_mount" ]]; then
+                log_warn "No se encontro DVD/ISO montado automaticamente."
+                log_info "Monte el DVD de OpenSUSE en VirtualBox: Dispositivos -> Unidades Opticas"
+                read -rp "   > Ruta donde esta montado el DVD (Enter = /mnt/dvd): " ruta_manual
+                iso_mount="${ruta_manual:-/mnt/dvd}"
+                mkdir -p "$iso_mount" 2>/dev/null
+                mount /dev/sr0 "$iso_mount" 2>/dev/null || true
+            fi
+
+            log_info "Intentando instalar desde: $iso_mount"
+            if zypper addrepo --no-gpgcheck "dir://$iso_mount" dvd-local 2>/dev/null; then
+                zypper refresh dvd-local 2>/dev/null
+                if zypper install -y dhcp-server; then
+                    log_ok "Paquete dhcp-server instalado desde DVD/ISO."
+                    instalado_pkg=true
+                fi
+                zypper removerepo dvd-local 2>/dev/null
+            fi
+        fi
+
+        if [[ "$instalado_pkg" == false ]]; then
+            log_error "No se pudo instalar dhcp-server por ninguna via."
+            log_error "Opciones: 1) Conecte la VM a internet  2) Monte el DVD de OpenSUSE en VirtualBox"
             if [[ -n "$ROLLBACK_IP" ]]; then
                 ip addr flush dev "$IFACE" 2>/dev/null
                 ip addr add "$ROLLBACK_IP" dev "$IFACE" 2>/dev/null
@@ -625,13 +660,13 @@ EOF
 while true; do
     clear
     echo ""
-    echo -e "  ${Y}╔═════════════════════════════╗${N}"
-    echo -e "  ${Y}║        GESTOR DHCP          ║${N}"
-    echo -e "  ${Y}╚═════════════════════════════╝${N}"
+    echo -e "  ${Y}╔══════════════════════════════════════════╗${N}"
+    echo -e "  ${Y}║        GESTOR DHCP - OpenSUSE            ║${N}"
+    echo -e "  ${Y}╚══════════════════════════════════════════╝${N}"
     echo ""
     echo "  [1] Verificar Estado del Servidor"
     echo "  [2] Instalar y Configurar"
-    echo "  [3] Monitorear"
+    echo "  [3] Monitorear Clientes Conectados"
     echo "  [4] Restaurar / Desinstalar"
     echo "  [5] Salir"
     echo ""
