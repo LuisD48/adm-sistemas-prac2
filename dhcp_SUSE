@@ -347,27 +347,51 @@ EOF
     echo -e "\n${Y}[PASO 4] Verificando paquete DHCP...${N}"
     if ! rpm -q dhcp-server &>/dev/null; then
         log_info "Instalando dhcp-server (modo no interactivo)..."
+        zypper refresh 2>/dev/null || log_warn "No se pudo refrescar repositorios, intentando igual..."
         if zypper install -y dhcp-server; then
             log_ok "Paquete dhcp-server instalado."
         else
-            log_error "No se pudo instalar dhcp-server. Verifique conexión o repositorios."
+            log_error "No se pudo instalar dhcp-server."
+            log_error "Posibles causas: sin internet, repositorios desactualizados o nombre incorrecto."
+            log_info "Intente manualmente: zypper install -y dhcp-server"
+            if [[ -n "$ROLLBACK_IP" ]]; then
+                ip addr flush dev "$IFACE" 2>/dev/null
+                ip addr add "$ROLLBACK_IP" dev "$IFACE" 2>/dev/null
+                [[ -n "$ROLLBACK_GW" ]] && ip route add default via "$ROLLBACK_GW" dev "$IFACE" 2>/dev/null
+                log_warn "Rollback ejecutado. IP restaurada: $ROLLBACK_IP"
+            fi
             pausar; return
         fi
     else
         log_ok "El paquete dhcp-server ya estaba instalado."
     fi
 
-    # F) ARRANCAR Y HABILITAR SERVICIO
-    echo -e "\n${Y}[PASO 5] Iniciando servicio DHCP...${N}"
-    systemctl enable "$SERVICIO" 2>/dev/null && log_ok "Servicio habilitado para inicio automático."
-    systemctl start "$SERVICIO" 2>/dev/null && log_ok "Servicio $SERVICIO iniciado." || \
-        log_warn "El servicio se iniciará tras escribir la configuración."
+    # F) CONFIGURAR INTERFAZ EN /etc/sysconfig/dhcpd (CRITICO en OpenSUSE)
+    echo -e "\n${Y}[PASO 5] Configurando interfaz para dhcpd...${N}"
+    local sysconfig_dhcpd="/etc/sysconfig/dhcpd"
+    if [[ -f "$sysconfig_dhcpd" ]]; then
+        if grep -q "^DHCPD_INTERFACE" "$sysconfig_dhcpd"; then
+            sed -i "s/^DHCPD_INTERFACE=.*/DHCPD_INTERFACE=\"$IFACE\"/" "$sysconfig_dhcpd"
+        else
+            echo "DHCPD_INTERFACE=\"$IFACE\"" >> "$sysconfig_dhcpd"
+        fi
+    else
+        echo "DHCPD_INTERFACE=\"$IFACE\"" > "$sysconfig_dhcpd"
+    fi
+    log_ok "Interfaz $IFACE configurada en $sysconfig_dhcpd"
 
-    # G) CONFIGURAR ÁMBITO
+    # G) ARRANCAR Y HABILITAR SERVICIO
+    echo -e "\n${Y}[PASO 6] Iniciando servicio DHCP...${N}"
+    systemctl enable "$SERVICIO" 2>/dev/null && log_ok "Servicio habilitado para inicio automatico."
+    systemctl start "$SERVICIO" 2>/dev/null && log_ok "Servicio $SERVICIO iniciado." || \
+        log_warn "El servicio se iniciara tras escribir la configuracion."
+
+    # H) CONFIGURAR AMBITO
     _configurar_scope
 
     pausar
 }
+
 
 # Función interna: escribe dhcpd.conf y reinicia servicio
 _configurar_scope() {
@@ -607,7 +631,7 @@ while true; do
     echo ""
     echo "  [1] Verificar Estado del Servidor"
     echo "  [2] Instalar y Configurar"
-    echo "  [3] Monitorear "
+    echo "  [3] Monitorear"
     echo "  [4] Restaurar / Desinstalar"
     echo "  [5] Salir"
     echo ""
