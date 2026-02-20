@@ -1,275 +1,624 @@
 #!/bin/bash
+# ============================================================
+# Gestor DHCP - OpenSUSE Linux
+# Equivalente Bash del script PowerShell dhcp_win_v6.ps1
+# Servicio: isc-dhcp-server (dhcp-server en OpenSUSE)
+# Archivo de config: /etc/dhcpd.conf
+# ============================================================
 
-# ==========================================
-#  GESTOR DHCP
-# ==========================================
+# --- COLORES ---
+R="\e[31m" G="\e[32m" Y="\e[33m" C="\e[36m" GR="\e[90m" N="\e[0m"
 
-# --- 1. VALIDACIONES INICIALES ---
+# --- RUTAS ---
+DHCP_CONF="/etc/dhcpd.conf"
+DHCP_LEASES="/var/lib/dhcp/db/dhcpd.leases"
+CONFIG_CACHE="/tmp/.dhcp_pendiente.conf"
+SERVICIO="dhcpd"
 
-# Validar que sea Root
-if [ "$EUID" -ne 0 ]; then
-  echo -e "\e[31m[ERROR] Este script requiere privilegios de administrador (root).\e[0m"
-  echo "Ejecute con: sudo $0"
-  exit 1
+# ============================================================
+# UTILIDADES
+# ============================================================
+
+separador() { echo -e "${GR}==================================================${N}"; }
+
+log_ok()    { echo -e "   ${G}[OK]${N} $1"; }
+log_warn()  { echo -e "   ${Y}[!]${N}  $1"; }
+log_error() { echo -e "   ${R}[X]${N}  $1"; }
+log_info()  { echo -e "   ${C}-->${N} $1"; }
+
+pausar() { read -rp "  Presione Enter para continuar..."; }
+
+# ============================================================
+# VALIDACIÓN: ROOT
+# ============================================================
+
+if [[ $EUID -ne 0 ]]; then
+    echo -e "\n${R}[ERROR FATAL] Ejecute este script como root (sudo).${N}"
+    exit 1
 fi
 
-# Función para validar formato IP (Regex)
-validar_ip() {
-    if [[ $1 =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        # Validar que no sea 0.0.0.0 o 255...
-        if [ "$1" == "0.0.0.0" ] || [ "$1" == "255.255.255.255" ]; then return 1; fi
-        return 0
-    else
-        return 1
+# ============================================================
+# FUNCIONES DE VALIDACIÓN DE IP
+# ============================================================
+
+validar_formato_ip() {
+    local ip="$1"
+    # Verifica formato XXX.XXX.XXX.XXX con valores 0-255
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+        if (( o1 <= 255 && o2 <= 255 && o3 <= 255 && o4 <= 255 )); then
+            return 0
+        fi
     fi
+    return 1
 }
 
-# Función para convertir IP a entero (para comparaciones)
-ip_a_int() {
-    IFS=. read -r a b c d <<< "$1"
-    echo $((a * 256 ** 3 + b * 256 ** 2 + c * 256 + d))
+es_ip_privada() {
+    local ip="$1"
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    # RFC 1918
+    [[ "$o1" == "10" ]] && return 0
+    [[ "$o1" == "172" && "$o2" -ge 16 && "$o2" -le 31 ]] && return 0
+    [[ "$o1" == "192" && "$o2" == "168" ]] && return 0
+    return 1
 }
 
-# --- 2. OPCIONES DEL MENÚ ---
-
-opcion1_verificar() {
-    clear
-    echo -e "\e[36m========================================\e[0m"
-    echo -e "\e[36m   [1] VERIFICAR INSTALACIÓN DHCP\e[0m"
-    echo -e "\e[36m========================================\e[0m"
-    
-    if rpm -q dhcp-server &> /dev/null; then
-        echo -e "\n\e[32m DHCP ESTÁ INSTALADO\e[0m"
-        
-        # Verificar servicio
-        if systemctl is-active --quiet dhcpd; then
-             echo -e " Estado del servicio: \e[32mRunning\e[0m"
-        else
-             echo -e " Estado del servicio: \e[33mStopped\e[0m"
-        fi
-    else
-        echo -e "\n\e[31m DHCP NO ESTÁ INSTALADO\e[0m"
-        echo -e "\e[33m Use la Opción [2] para instalarlo.\e[0m"
-    fi
-    read -p "Presione Enter para volver..."
+ip_a_entero() {
+    local ip="$1"
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    echo $(( (o1 << 24) + (o2 << 16) + (o3 << 8) + o4 ))
 }
 
-opcion2_instalacion() {
-    clear
-    echo -e "\e[36m========================================\e[0m"
-    echo -e "\e[36m   [2] INSTALACIÓN DHCP\e[0m"
-    echo -e "\e[36m========================================\e[0m"
+misma_subred_24() {
+    # Compara los primeros 3 octetos (red /24)
+    local ip1="$1" ip2="$2"
+    local red1 red2
+    red1=$(echo "$ip1" | cut -d. -f1-3)
+    red2=$(echo "$ip2" | cut -d. -f1-3)
+    [[ "$red1" == "$red2" ]]
+}
 
-    # A. INSTALACIÓN DE PAQUETES
-    if rpm -q dhcp-server &> /dev/null; then
-        echo -e "\e[33m[INFO] DHCP ya está instalado.\e[0m"
-        read -p "¿Desea REINSTALAR y borrar configuración? (s/n): " resp
-        if [[ "$resp" =~ ^[sS]$ ]]; then
-            echo "Desinstalando..."
-            zypper remove -y dhcp-server &> /dev/null
-            rm -rf /etc/dhcpd.conf
-            echo "Reinstalando..."
-            zypper install -y dhcp-server &> /dev/null
-        fi
-    else
-        echo "Instalando DHCP (puede tardar)..."
-        zypper install -y dhcp-server
-        if [ $? -ne 0 ]; then
-            echo -e "\e[31m[ERROR] Falló la instalación. Revisa tu internet.\e[0m"
-            read -p "Enter para volver..."
-            return
-        fi
-        echo -e "\e[32m[OK] Instalado.\e[0m"
-    fi
-
-    # B. CONFIGURACIÓN (WIZARD)
-    echo -e "\n\e[36m--- CONFIGURACIÓN DEL ÁMBITO ---\e[0m"
-
-    # 1. Selección de Interfaz (OBLIGATORIO EN LINUX)
-    # Listamos tarjetas para que el usuario elija
-    echo "Interfaces disponibles:"
-    ip -o link show | awk -F': ' '{print $2}' | grep -vE "^(lo|docker|virbr)" > /tmp/ifaces.txt
-    IFS=$'\n' read -d '' -r -a interfaces < /tmp/ifaces.txt
-    
-    cnt=1
-    for iface in "${interfaces[@]}"; do
-        IP_ACTUAL=$(ip -4 addr show $iface | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-        echo "[$cnt] $iface (IP: ${IP_ACTUAL:-Sin IP})"
-        ((cnt++))
-    done
+solicitar_ip() {
+    # Parámetros: mensaje [ip_referencia] [es_final:0|1] [subred_ref] [permitir_cualquier:0|1]
+    local mensaje="$1"
+    local ip_ref="$2"
+    local es_final="${3:-0}"
+    local subred_ref="$4"
+    local permitir_cualquier="${5:-0}"
+    local input
 
     while true; do
-        read -p "Seleccione el NÚMERO de la interfaz (ej. 1): " sel
-        if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#interfaces[@]}" ]; then
-            IFACE=${interfaces[$((sel-1))]}
-            break
-        else
-            echo -e "\e[31mOpción inválida.\e[0m"
-        fi
-    done
+        read -rp "   > $mensaje: " input
 
-    # 2. Datos del Ámbito
-    read -p "Nombre del Ámbito (ej. Red-Sistemas): " NOMBRE_SCOPE
-    
-    # IP Inicial (.50)
-    while true; do
-        read -p "IP Inicial (debe terminar en .50): " IP_START
-        if ! validar_ip $IP_START; then echo "Formato inválido"; continue; fi
-        
-        # Validar terminación .50
-        OCTETO_FINAL=$(echo $IP_START | awk -F. '{print $4}')
-        if [ "$OCTETO_FINAL" -ne 50 ]; then
-            echo -e "\e[31m[ERROR] La IP debe terminar en .50\e[0m"
-        else
-            break
-        fi
-    done
-
-    # IP Final (.150)
-    while true; do
-        read -p "IP Final (debe terminar en .150): " IP_END
-        if ! validar_ip $IP_END; then echo "Formato inválido"; continue; fi
-        
-        # Validar terminación .150
-        OCTETO_FINAL=$(echo $IP_END | awk -F. '{print $4}')
-        if [ "$OCTETO_FINAL" -ne 150 ]; then
-            echo -e "\e[31m[ERROR] La IP debe terminar en .150\e[0m"
+        # 1. Formato
+        if ! validar_formato_ip "$input"; then
+            log_error "Formato inválido. Use XXX.XXX.XXX.XXX (Ej. 192.168.1.10)"
             continue
         fi
 
-        # Validar Mayor que inicial
-        INT_START=$(ip_a_int $IP_START)
-        INT_END=$(ip_a_int $IP_END)
-        if [ $INT_START -ge $INT_END ]; then
-            echo -e "\e[31m[ERROR] La IP Final debe ser mayor a la Inicial.\e[0m"
+        # 2. No permitir 0.0.0.0 ni 255.255.255.255
+        if [[ "$input" == "0.0.0.0" || "$input" == "255.255.255.255" ]]; then
+            log_error "Dirección IP no válida técnicamente."
+            continue
+        fi
+
+        # 3. RFC 1918 (excepto gateway)
+        if [[ "$permitir_cualquier" == "0" ]]; then
+            if ! es_ip_privada "$input"; then
+                log_error "Solo se permiten IPs privadas (10.x.x.x / 172.16-31.x.x / 192.168.x.x)."
+                continue
+            fi
+        fi
+
+        # 4. No broadcast como IP final
+        if [[ "$es_final" == "1" ]]; then
+            local ultimo_octeto
+            ultimo_octeto=$(echo "$input" | cut -d. -f4)
+            if [[ "$ultimo_octeto" == "255" ]]; then
+                log_error "No puede usar la dirección de broadcast (.255) como IP Final."
+                continue
+            fi
+        fi
+
+        # 5. IP final debe ser mayor que la inicial
+        if [[ "$es_final" == "1" && -n "$ip_ref" ]]; then
+            local val_actual val_ref
+            val_actual=$(ip_a_entero "$input")
+            val_ref=$(ip_a_entero "$ip_ref")
+            if (( val_actual <= val_ref )); then
+                log_error "La IP Final debe ser MAYOR que la Inicial ($ip_ref)."
+                continue
+            fi
+        fi
+
+        # 6. Misma subred /24
+        if [[ "$permitir_cualquier" == "0" && -n "$subred_ref" ]]; then
+            if ! misma_subred_24 "$input" "$subred_ref"; then
+                local red_ref
+                red_ref=$(echo "$subred_ref" | cut -d. -f1-3)
+                log_error "La IP debe estar en la misma red /24 que $subred_ref (${red_ref}.x)."
+                continue
+            fi
+        fi
+
+        echo "$input"
+        return 0
+    done
+}
+
+# ============================================================
+# OPCIÓN 1: VERIFICAR ESTADO
+# ============================================================
+
+opcion1_verificar() {
+    clear
+    separador
+    echo -e "  ${C}VERIFICACIÓN DE ESTADO DEL SERVIDOR DHCP${N}"
+    separador
+
+    # Verificar si el paquete está instalado
+    if rpm -q dhcp-server &>/dev/null; then
+        log_ok "Paquete dhcp-server: INSTALADO"
+    else
+        log_warn "Paquete dhcp-server: NO INSTALADO"
+    fi
+
+    # Estado del servicio
+    if systemctl is-active --quiet "$SERVICIO"; then
+        log_ok "Servicio $SERVICIO: ACTIVO (running)"
+    else
+        log_warn "Servicio $SERVICIO: INACTIVO"
+    fi
+
+    # Tipo de inicio
+    if systemctl is-enabled --quiet "$SERVICIO" 2>/dev/null; then
+        log_ok "Inicio automático: HABILITADO"
+    else
+        log_warn "Inicio automático: DESHABILITADO"
+    fi
+
+    # Mostrar ámbitos (subnets) del archivo de config
+    echo ""
+    echo -e "  ${Y}Configuración actual ($DHCP_CONF):${N}"
+    if [[ -f "$DHCP_CONF" ]]; then
+        grep -E "subnet|range|option routers|option domain-name-servers|default-lease" "$DHCP_CONF" 2>/dev/null | \
+            sed 's/^/    /' || echo "    (Sin configuración)"
+    else
+        echo "    (Archivo no existe aún)"
+    fi
+
+    pausar
+}
+
+# ============================================================
+# OPCIÓN 2: INSTALAR Y CONFIGURAR
+# ============================================================
+
+opcion2_instalar_configurar() {
+    clear
+    separador
+    echo -e "  ${C}CONFIGURACIÓN COMPLETA: RED + DHCP${N}"
+    separador
+
+    # *** DETECTAR CONFIGURACIÓN GUARDADA (post-reinicio) ***
+    if [[ -f "$CONFIG_CACHE" ]]; then
+        echo -e "\n  ${Y}[!] Se encontró una configuración pendiente guardada:${N}"
+        # shellcheck disable=SC1090
+        source "$CONFIG_CACHE"
+        echo "      Interfaz  : $IFACE"
+        echo "      Server IP : $SERVER_IP"
+        echo "      Rango     : $START_SCOPE -> $END_IP"
+        echo "      Gateway   : $GATEWAY"
+        echo "      DNS       : $DNS"
+        echo "      Scope     : $SCOPE_NAME"
+        echo "      Lease     : $LEASE_HORAS hora(s)"
+        read -rp "  ¿Usar esta configuración guardada? (s/N): " usar
+        if [[ "$usar" =~ ^[sS]$ ]]; then
+            _configurar_scope
+            rm -f "$CONFIG_CACHE"
+            pausar; return
         else
+            rm -f "$CONFIG_CACHE"
+        fi
+    fi
+
+    # A) SELECCIÓN DE INTERFAZ DE RED
+    echo -e "\n${Y}[PASO 1] Seleccione la Interfaz de Red:${N}"
+    mapfile -t IFACES < <(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo")
+    local i=1
+    for iface in "${IFACES[@]}"; do
+        local ip_actual
+        ip_actual=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP '(?<=inet )\S+' | cut -d/ -f1)
+        ip_actual="${ip_actual:-Sin IP}"
+        echo "   [$i] $iface | IP Actual: $ip_actual"
+        (( i++ ))
+    done
+
+    local sel_index
+    while true; do
+        read -rp "   > Número de opción: " sel
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#IFACES[@]} )); then
+            sel_index=$(( sel - 1 ))
             break
         fi
+        log_error "Selección inválida."
     done
+    IFACE="${IFACES[$sel_index]}"
+    log_info "Interfaz seleccionada: $IFACE"
 
-    # Gateway y DNS
+    # B) SOLICITUD DE DATOS
+    echo -e "\n${Y}[PASO 2] Definición de Direcciones (misma red /24):${N}"
+
+    SERVER_IP=$(solicitar_ip "IP Estática del Servidor (inicio del rango)")
+
+    END_IP=$(solicitar_ip "IP Final del Rango DHCP" "$SERVER_IP" "1" "$SERVER_IP" "0")
+
+    GATEWAY=$(solicitar_ip "Puerta de Enlace (Gateway)" "" "0" "" "1")
+
+    read -rp "   > DNS (Enter = usar $SERVER_IP): " dns_input
+    if validar_formato_ip "$dns_input" 2>/dev/null; then
+        DNS="$dns_input"
+    else
+        DNS="$SERVER_IP"
+    fi
+
+    read -rp "   > Nombre del Ámbito DHCP (Enter = 'Red_Interna'): " scope_input
+    SCOPE_NAME="${scope_input:-Red_Interna}"
+
+    # Lease Time
     while true; do
-        read -p "Gateway: " GATEWAY
-        validar_ip $GATEWAY && break || echo "IP inválida"
+        read -rp "   > Tiempo de concesión en horas (Enter = 8): " lease_input
+        lease_input="${lease_input:-8}"
+        if [[ "$lease_input" =~ ^[0-9]+$ ]] && (( lease_input >= 1 && lease_input <= 9999 )); then
+            LEASE_HORAS="$lease_input"
+            break
+        fi
+        log_error "Ingrese un número entero entre 1 y 9999."
+    done
+    LEASE_SEGUNDOS=$(( LEASE_HORAS * 3600 ))
+
+    # Calcular inicio del rango (Server+1)
+    IFS='.' read -r o1 o2 o3 o4 <<< "$SERVER_IP"
+    START_SCOPE="${o1}.${o2}.${o3}.$(( o4 + 1 ))"
+    SUBRED="${o1}.${o2}.${o3}.0"
+
+    # C) RESUMEN
+    echo ""; separador
+    echo -e "  ${C}RESUMEN DE CONFIGURACIÓN${N}"
+    separador
+    echo "  Interfaz   : $IFACE"
+    echo "  Server IP  : $SERVER_IP  (IP estática del servidor)"
+    echo "  Rango DHCP : $START_SCOPE  ->  $END_IP"
+    echo "  Gateway    : $GATEWAY"
+    echo "  DNS        : $DNS"
+    echo "  Scope Name : $SCOPE_NAME"
+    echo "  Lease Time : $LEASE_HORAS hora(s)"
+    separador
+
+    read -rp "¿Aplicar configuración? (s/N): " conf
+    if [[ ! "$conf" =~ ^[sS]$ ]]; then
+        log_warn "Configuración cancelada."; pausar; return
+    fi
+
+    # Countdown
+    for t in 3 2 1; do
+        echo -e "   ${Y}Aplicando ..."; sleep 1
     done
 
-    while true; do
-        read -p "DNS Primario: " DNS1
-        validar_ip $DNS1 && break || echo "IP inválida"
-    done
+    # D) APLICAR IP ESTÁTICA
+    echo -e "\n${Y}[PASO 3] Configurando IP Estática...${N}"
+    # Guardar estado actual para rollback
+    ROLLBACK_IP=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -oP '(?<=inet )\S+' | head -1)
+    ROLLBACK_GW=$(ip route show dev "$IFACE" default 2>/dev/null | awk '{print $3}' | head -1)
 
-    # Calcular Datos de Red (Máscara y Subnet)
-    # Asumimos clase C estándar (/24) basado en el input del usuario
-    SUBNET=$(echo $IP_START | cut -d'.' -f1-3).0
-    NETMASK="255.255.255.0" # Simplificado como en el script de Windows
+    # Quitar IP y rutas anteriores
+    ip addr flush dev "$IFACE" 2>/dev/null
+    ip route del default dev "$IFACE" 2>/dev/null || true
 
-    echo -e "\n\e[36m--- RESUMEN ---\e[0m"
-    echo "Interfaz: $IFACE"
-    echo "Rango:    $IP_START - $IP_END"
-    echo "Mascara:  $NETMASK"
-    echo "Gateway:  $GATEWAY"
-    
-    read -p "¿Confirmar configuración? (s/n): " confirm
-    if [[ ! "$confirm" =~ ^[sS]$ ]]; then return; fi
+    # Asignar IP estática
+    if ip addr add "${SERVER_IP}/24" dev "$IFACE" && \
+       ip route add default via "$GATEWAY" dev "$IFACE"; then
+        log_ok "IP estática asignada: $SERVER_IP"
 
-    # C. APLICAR CONFIGURACIÓN
-    echo "Generando /etc/dhcpd.conf..."
-    
-    cat > /etc/dhcpd.conf <<EOF
-option domain-name "$NOMBRE_SCOPE";
-option domain-name-servers $DNS1;
-default-lease-time 600;
-max-lease-time 7200;
-ddns-update-style none;
+        # Persistir con wicked (OpenSUSE)
+        local cfg_iface="/etc/sysconfig/network/ifcfg-${IFACE}"
+        cat > "$cfg_iface" <<EOF
+BOOTPROTO='static'
+IPADDR='${SERVER_IP}'
+NETMASK='255.255.255.0'
+GATEWAY='${GATEWAY}'
+STARTMODE='auto'
+EOF
+        # DNS persistente
+        echo "nameserver $DNS" > /etc/resolv.conf
+        log_ok "Configuración de red persistida en $cfg_iface"
+    else
+        log_error "Error configurando IP estática."
+        # Rollback
+        if [[ -n "$ROLLBACK_IP" ]]; then
+            ip addr add "$ROLLBACK_IP" dev "$IFACE" 2>/dev/null
+            [[ -n "$ROLLBACK_GW" ]] && ip route add default via "$ROLLBACK_GW" dev "$IFACE" 2>/dev/null
+            log_warn "Rollback ejecutado. IP restaurada: $ROLLBACK_IP"
+        fi
+        pausar; return
+    fi
+
+    # E) INSTALAR DHCP
+    echo -e "\n${Y}[PASO 4] Verificando paquete DHCP...${N}"
+    if ! rpm -q dhcp-server &>/dev/null; then
+        log_info "Instalando dhcp-server (modo no interactivo)..."
+        if zypper install -y dhcp-server; then
+            log_ok "Paquete dhcp-server instalado."
+        else
+            log_error "No se pudo instalar dhcp-server. Verifique conexión o repositorios."
+            pausar; return
+        fi
+    else
+        log_ok "El paquete dhcp-server ya estaba instalado."
+    fi
+
+    # F) ARRANCAR Y HABILITAR SERVICIO
+    echo -e "\n${Y}[PASO 5] Iniciando servicio DHCP...${N}"
+    systemctl enable "$SERVICIO" 2>/dev/null && log_ok "Servicio habilitado para inicio automático."
+    systemctl start "$SERVICIO" 2>/dev/null && log_ok "Servicio $SERVICIO iniciado." || \
+        log_warn "El servicio se iniciará tras escribir la configuración."
+
+    # G) CONFIGURAR ÁMBITO
+    _configurar_scope
+
+    pausar
+}
+
+# Función interna: escribe dhcpd.conf y reinicia servicio
+_configurar_scope() {
+    echo -e "\n${Y}[PASO 6] Creando Ámbito DHCP...${N}"
+
+    # Hacer backup del config anterior si existe
+    [[ -f "$DHCP_CONF" ]] && cp "$DHCP_CONF" "${DHCP_CONF}.bak" && \
+        log_info "Backup guardado en ${DHCP_CONF}.bak"
+
+    # Escribir dhcpd.conf
+    cat > "$DHCP_CONF" <<EOF
+# ============================================================
+# Gestor DHCP - OpenSUSE | Scope: $SCOPE_NAME
+# Generado automáticamente
+# ============================================================
+
+default-lease-time $LEASE_SEGUNDOS;
+max-lease-time $(( LEASE_SEGUNDOS * 2 ));
+
 authoritative;
 
-subnet $SUBNET netmask $NETMASK {
-  range $IP_START $IP_END;
-  option routers $GATEWAY;
+subnet $SUBRED netmask 255.255.255.0 {
+    range $START_SCOPE $END_IP;
+    option routers $GATEWAY;
+    option domain-name-servers $DNS;
+    option subnet-mask 255.255.255.0;
 }
 EOF
 
-    # D. VINCULAR INTERFAZ (Truco OpenSUSE)
-    sed -i 's/^DHCPD_INTERFACE=.*/DHCPD_INTERFACE="'$IFACE'"/' /etc/sysconfig/dhcpd
-
-    # E. FIREWALL Y SERVICIO
-    echo "Abriendo Firewall..."
-    firewall-cmd --add-service=dhcp --permanent &> /dev/null
-    firewall-cmd --reload &> /dev/null
-
-    echo "Reiniciando servicio..."
-    systemctl enable dhcpd &> /dev/null
-    systemctl restart dhcpd
-
-    if systemctl is-active --quiet dhcpd; then
-        echo -e "\n\e[32m   DHCP CONFIGURADO CORRECTAMENTE   \e[0m"
-        echo "Cliente Linux: sudo dhclient -v $IFACE"
-        echo "Cliente Windows: ipconfig /renew"
+    # Validar sintaxis antes de reiniciar
+    if dhcpd -t -cf "$DHCP_CONF" &>/dev/null; then
+        log_ok "Sintaxis del archivo de configuración válida."
     else
-        echo -e "\n\e[31m[ERROR] El servicio no arrancó.\e[0m"
-        systemctl status dhcpd --no-pager
+        log_error "Error de sintaxis en $DHCP_CONF. Revise el archivo."
+        dhcpd -t -cf "$DHCP_CONF"
+        return 1
     fi
-    read -p "Presione Enter para volver..."
+
+    # Reiniciar servicio
+    if systemctl restart "$SERVICIO"; then
+        log_ok "Servicio $SERVICIO reiniciado correctamente."
+    else
+        log_error "Error al reiniciar $SERVICIO."
+        systemctl status "$SERVICIO" --no-pager | tail -10
+        return 1
+    fi
+
+    echo ""; separador
+    echo -e "  ${G}CONFIGURACION EXITOSA${N}"
+    separador
+    echo "  IP Servidor : $SERVER_IP"
+    echo "  Rango DHCP  : $START_SCOPE  -->  $END_IP"
+    echo "  Scope       : $SCOPE_NAME ($SUBRED)"
+    echo "  Lease Time  : $LEASE_HORAS hora(s)"
+    separador
 }
+
+# ============================================================
+# OPCIÓN 3: MONITOREAR CLIENTES
+# ============================================================
 
 opcion3_monitorear() {
     clear
-    echo -e "\e[36m========================================\e[0m"
-    echo -e "\e[36m   [3] MONITOREAR CONCESIONES\e[0m"
-    echo -e "\e[36m========================================\e[0m"
-    
-    LEASE_FILE="/var/lib/dhcp/db/dhcpd.leases"
-    
-    if [ -f "$LEASE_FILE" ]; then
-        echo -e "\nIP ADDRESS\tMAC ADDRESS\tHOSTNAME"
-        echo "------------------------------------------------"
-        # Pequeño parser para mostrar datos limpios
-        grep -E "lease|hardware|client-hostname" $LEASE_FILE | awk '
-        /lease/ {ip=$2} 
-        /hardware/ {mac=$3} 
-        /client-hostname/ {name=$2; print ip "\t" mac "\t" name}' | sed 's/;//g' | sed 's/"//g'
-    else
-        echo -e "\e[33mNo hay archivo de concesiones aún.\e[0m"
+    separador
+    echo -e "  ${C}CLIENTES DHCP CONECTADOS${N}"
+    separador
+
+    # Verificar servicio activo
+    if ! systemctl is-active --quiet "$SERVICIO"; then
+        log_error "El servicio $SERVICIO no está activo. Inicie el servidor primero."
+        pausar; return
     fi
-    read -p "Presione Enter para volver..."
+
+    if [[ ! -f "$DHCP_LEASES" ]]; then
+        log_warn "Archivo de leases no encontrado: $DHCP_LEASES"
+        pausar; return
+    fi
+
+    # Parsear leases activos
+    echo -e "\n  ${Y}Leases activos:${N}"
+    local count=0
+    local ip mac hostname expires
+
+    # Leer bloques de lease del archivo
+    while IFS= read -r linea; do
+        if [[ "$linea" =~ ^lease\ ([0-9.]+) ]]; then
+            ip="${BASH_REMATCH[1]}"
+            mac=""; hostname=""; expires=""
+        elif [[ "$linea" =~ hardware\ ethernet\ (.+)\; ]]; then
+            mac="${BASH_REMATCH[1]}"
+        elif [[ "$linea" =~ client-hostname\ \"(.+)\" ]]; then
+            hostname="${BASH_REMATCH[1]}"
+        elif [[ "$linea" =~ ends\ [0-9]\ (.+)\; ]]; then
+            expires="${BASH_REMATCH[1]}"
+        elif [[ "$linea" == "}" && -n "$ip" ]]; then
+            printf "  %-18s %-20s %-20s %s\n" "$ip" "${mac:-N/A}" "${hostname:-N/A}" "${expires:-N/A}"
+            (( count++ ))
+            ip=""
+        fi
+    done < "$DHCP_LEASES"
+
+    if (( count == 0 )); then
+        log_warn "No hay clientes conectados actualmente."
+    else
+        echo ""
+        log_ok "Total de clientes: $count"
+
+        # Exportar a CSV
+        read -rp "  ¿Exportar lista a CSV? (s/N): " export_csv
+        if [[ "$export_csv" =~ ^[sS]$ ]]; then
+            local csv_path="/tmp/clientes_dhcp_$(date +%Y%m%d_%H%M%S).csv"
+            echo "IP,MAC,Hostname,Expira" > "$csv_path"
+            while IFS= read -r linea; do
+                if [[ "$linea" =~ ^lease\ ([0-9.]+) ]]; then
+                    ip="${BASH_REMATCH[1]}"; mac=""; hostname=""; expires=""
+                elif [[ "$linea" =~ hardware\ ethernet\ (.+)\; ]]; then
+                    mac="${BASH_REMATCH[1]}"
+                elif [[ "$linea" =~ client-hostname\ \"(.+)\" ]]; then
+                    hostname="${BASH_REMATCH[1]}"
+                elif [[ "$linea" =~ ends\ [0-9]\ (.+)\; ]]; then
+                    expires="${BASH_REMATCH[1]}"
+                elif [[ "$linea" == "}" && -n "$ip" ]]; then
+                    echo "$ip,$mac,$hostname,$expires" >> "$csv_path"
+                    ip=""
+                fi
+            done < "$DHCP_LEASES"
+            log_ok "Lista exportada a: $csv_path"
+        fi
+    fi
+
+    pausar
 }
+
+# ============================================================
+# OPCIÓN 4: RESTAURAR / DESINSTALAR
+# ============================================================
 
 opcion4_restaurar() {
     clear
-    echo -e "\e[31m========================================\e[0m"
-    echo -e "\e[31m   [4] RESTAURAR (DESINSTALAR)\e[0m"
-    echo -e "\e[31m========================================\e[0m"
-    
-    read -p "¿ESTÁ SEGURO? Se borrará todo (s/n): " confirm
-    if [[ "$confirm" =~ ^[sS]$ ]]; then
-        systemctl stop dhcpd
-        zypper remove -y dhcp-server
-        rm -rf /etc/dhcpd.conf
-        rm -rf /var/lib/dhcp/db/dhcpd.leases
-        echo -e "\e[32m[LISTO] Sistema limpio.\e[0m"
+    separador
+    echo -e "  ${R}DESINSTALACIÓN Y RESTAURACIÓN${N}"
+    separador
+
+    echo -e "  ${Y}[!] Esta acción eliminará dhcp-server, su configuración${N}"
+    echo -e "  ${Y}[!] y convertirá la IP estática en dinámica (DHCP cliente).${N}"
+
+    # Seleccionar interfaz a restaurar
+    echo -e "\n  Seleccione la interfaz de red a restaurar a IP dinámica:"
+    mapfile -t IFACES < <(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo")
+    local i=1
+    for iface in "${IFACES[@]}"; do
+        local ip_actual
+        ip_actual=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP '(?<=inet )\S+' | cut -d/ -f1)
+        ip_actual="${ip_actual:-Sin IP}"
+        echo "  [$i] $iface | IP: $ip_actual"
+        (( i++ ))
+    done
+
+    local iface_restore=""
+    while true; do
+        read -rp "  > Número de opción (0 = no cambiar IP): " sel
+        if [[ "$sel" == "0" ]]; then break; fi
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#IFACES[@]} )); then
+            iface_restore="${IFACES[$(( sel - 1 ))]}"; break
+        fi
+        log_error "Selección inválida."
+    done
+
+    read -rp "  Escriba 'BORRAR' para confirmar: " conf
+    if [[ "$conf" != "BORRAR" ]]; then
+        log_warn "Desinstalación cancelada."
+        pausar; return
     fi
-    read -p "Presione Enter para volver..."
+
+    log_info "Iniciando desinstalación de DHCP..."
+
+    # 1. Restaurar IP dinámica
+    if [[ -n "$iface_restore" ]]; then
+        ip addr flush dev "$iface_restore" 2>/dev/null
+        ip route del default dev "$iface_restore" 2>/dev/null || true
+
+        # Configurar como DHCP cliente con wicked
+        local cfg_iface="/etc/sysconfig/network/ifcfg-${iface_restore}"
+        cat > "$cfg_iface" <<EOF
+BOOTPROTO='dhcp'
+STARTMODE='auto'
+EOF
+        # Limpiar DNS manual
+        rm -f /etc/resolv.conf
+        ln -sf /run/netconfig/resolv.conf /etc/resolv.conf 2>/dev/null || true
+
+        # Solicitar IP por DHCP inmediatamente
+        wicked ifdown "$iface_restore" 2>/dev/null || true
+        wicked ifup "$iface_restore" 2>/dev/null || true
+        log_ok "Interfaz '$iface_restore' restaurada a IP dinámica (DHCP cliente)."
+    fi
+
+    # 2. Detener y deshabilitar servicio ANTES de desinstalar
+    if systemctl is-active --quiet "$SERVICIO"; then
+        systemctl stop "$SERVICIO" && log_ok "Servicio $SERVICIO detenido."
+    fi
+    systemctl disable "$SERVICIO" 2>/dev/null && log_ok "Servicio $SERVICIO deshabilitado."
+
+    # 3. Eliminar configuración
+    if [[ -f "$DHCP_CONF" ]]; then
+        rm -f "$DHCP_CONF" && log_ok "Archivo $DHCP_CONF eliminado."
+    fi
+
+    # 4. Limpiar config cache si existe
+    [[ -f "$CONFIG_CACHE" ]] && rm -f "$CONFIG_CACHE" && log_ok "Configuración pendiente eliminada."
+
+    # 5. Desinstalar paquete
+    if rpm -q dhcp-server &>/dev/null; then
+        if zypper remove -y dhcp-server; then
+            log_ok "Paquete dhcp-server desinstalado."
+        else
+            log_error "Error al desinstalar dhcp-server."
+        fi
+    else
+        log_warn "El paquete dhcp-server no estaba instalado."
+    fi
+
+    log_ok "Sistema restaurado correctamente."
+    pausar
 }
 
-# --- 3. BUCLE PRINCIPAL ---
+# ============================================================
+# MENÚ PRINCIPAL
+# ============================================================
 
 while true; do
     clear
-    echo -e "\e[33m===   MENU (OpenSUSE)   ===\e[0m"
-    echo "[1] Verificar instalacion DHCP"
-    echo "[2] Instalacion (Silenciosa)"
-    echo "[3] Monitorear"
-    echo "[4] Restaurar"
-    echo "[5] Salir"
     echo ""
-    read -p "Seleccione una opción: " op
-    
-    case $op in
+    echo -e "  ${Y}╔═════════════════════════════╗${N}"
+    echo -e "  ${Y}║        GESTOR DHCP          ║${N}"
+    echo -e "  ${Y}╚═════════════════════════════╝${N}"
+    echo ""
+    echo "  [1] Verificar Estado del Servidor"
+    echo "  [2] Instalar y Configurar"
+    echo "  [3] Monitorear "
+    echo "  [4] Restaurar / Desinstalar"
+    echo "  [5] Salir"
+    echo ""
+    read -rp "  Opción: " op
+
+    case "$op" in
         1) opcion1_verificar ;;
-        2) opcion2_instalacion ;;
+        2) opcion2_instalar_configurar ;;
         3) opcion3_monitorear ;;
         4) opcion4_restaurar ;;
         5) echo "Saliendo..."; exit 0 ;;
-        *) echo "Opción inválida." ; sleep 1 ;;
+        *) echo -e "  ${R}Opción no válida.${N}"; sleep 1 ;;
     esac
 done
