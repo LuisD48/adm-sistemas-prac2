@@ -1,7 +1,7 @@
-Set-Content -Path "dhcp_win_v6.ps1" -Value @'
+Set-Content -Path "dhcp_win.ps1" -Value @'
 <#
 .SYNOPSIS
-    Gestor DHCP "Blindado" - V6 MEJORADO
+    Gestor DHCP
 .DESCRIPTION
     Mejoras sobre V5:
     - Validación que IPs del rango sean de la misma subred /24
@@ -95,21 +95,7 @@ function Solicitar-IP {
             continue
         }
 
-        # 3. RFC 1918: solo IPs privadas (excepto Gateway)
-        if (-not $PermitirCualquier) {
-            $oct = $InputIP.Split(".")
-            $esPrivada = (
-                $oct[0] -eq "10" -or
-                ($oct[0] -eq "172" -and [int]$oct[1] -ge 16 -and [int]$oct[1] -le 31) -or
-                ($oct[0] -eq "192" -and $oct[1] -eq "168")
-            )
-            if (-not $esPrivada) {
-                Write-Host "   [X] Solo se permiten IPs privadas (10.x.x.x / 172.16-31.x.x / 192.168.x.x)." -ForegroundColor Red
-                continue
-            }
-        }
-
-        # 4. No permitir dirección de broadcast (...255) como EndIP
+        # 3. No permitir dirección de broadcast (...255) como EndIP
         if ($EsIpFinal) {
             $octetos = $InputIP.Split(".")
             if ($octetos[3] -eq "255") {
@@ -124,17 +110,6 @@ function Solicitar-IP {
             $valRef    = Convertir-IpAEntero $IpReferencia
             if ($valActual -le $valRef) {
                 Write-Host "   [X] La IP Final debe ser MAYOR que la Inicial ($IpReferencia)." -ForegroundColor Red
-                continue
-            }
-        }
-
-        # 6. Verificar misma subred /24 (para StartIP, EndIP)
-        if (-not $PermitirCualquier -and $IpSubredRef) {
-            $redEntrada = Obtener-RedBase $InputIP
-            $redRef     = Obtener-RedBase $IpSubredRef
-            if ($redEntrada -ne $redRef) {
-                $refOctetos = $IpSubredRef.Split(".")
-                Write-Host "   [X] La IP debe estar en la misma red /24 que $IpSubredRef ($($refOctetos[0]).$($refOctetos[1]).$($refOctetos[2]).x)." -ForegroundColor Red
                 continue
             }
         }
@@ -646,12 +621,12 @@ function Opcion4-Restaurar {
 Do {
     Clear-Host
     Write-Host ""
-    Write-Host "" 
-    Write-Host "	GESTOR DHCP		" -ForegroundColor Yellow
-    Write-Host "" 
+    Write-Host "  ╔═════════════════╗" -ForegroundColor Yellow
+    Write-Host "  ║    GESTOR DHCP  ║" -ForegroundColor Yellow
+    Write-Host "  ╚═════════════════╝" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "  [1] Verificar Estado del Servidor"
-    Write-Host "  [2] Instalar y configurar"
+    Write-Host "  [2] Configurar"
     Write-Host "  [3] Monitorear Clientes Conectados"
     Write-Host "  [4] Restaurar / Desinstalar"
     Write-Host "  [5] Salir"
