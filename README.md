@@ -1,14 +1,14 @@
-# 🛠️ Práctica 2: Automatización y Gestión del Servidor DHCP
+# Práctica 2: Automatización y Gestión del Servidor DHCP
 
 Este repositorio contiene la implementación de una solución automatizada mediante scripts (Bash y PowerShell) para la instalación, configuración y monitoreo de un servidor DHCP. El sistema gestiona el direccionamiento dinámico de una red interna de forma segura y desatendida, garantizando la integridad de los parámetros de red entregados a los nodos cliente.
 
 **Autor:** Luis
 **Materia:** Administración de Sistemas
 
-## 🎯 Objetivo del Proyecto
+## Objetivo del Proyecto
 Diseñar y desplegar una arquitectura de red automatizada capaz de orquestar servicios DHCP en entornos heterogéneos (Linux y Windows Server). Los scripts aseguran la instalación idempotente de los demonios/roles necesarios, la configuración dinámica de ámbitos (scopes) y la validación en tiempo real del estado del servicio.
 
-## 📋 Requerimientos Técnicos Implementados
+## Requerimientos Técnicos Implementados
 El entorno está configurado para operar bajo los siguientes parámetros base:
 - **Segmento de Red:** `192.168.100.0 /24`
 - **Rango de Asignación:** `192.168.100.50` al `192.168.100.150`
@@ -16,7 +16,7 @@ El entorno está configurado para operar bajo los siguientes parámetros base:
 - **Servicio Linux:** `dhcp-server` (basado en `isc-dhcp-server`)
 - **Servicio Windows:** Rol `DHCP Server` nativo
 
-## ✨ Entregables y Características Principales
+## Entregables y Características Principales
 
 ### 1. Instalación Idempotente y Desatendida
 Los scripts evalúan el estado actual del sistema antes de realizar cambios.
@@ -36,7 +36,7 @@ Se incluye una suite de diagnóstico integrada en el menú principal para:
 - Consultar el estado del servicio (`systemctl status dhcpd` / `Get-Service dhcpserver`) en tiempo real.
 - Listar las concesiones activas, leyendo directamente de `/var/lib/dhcp/db/dhcpd.leases` en Linux o usando `Get-DhcpServerv4Lease` en Windows.
 
-## 💻 Instrucciones de Ejecución
+## Instrucciones de Ejecución
 
 ### Entorno Linux (OpenSUSE)
 1. Clona el repositorio:
